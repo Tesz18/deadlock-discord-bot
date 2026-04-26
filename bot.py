@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 from news_sources import NewsItem, fetch_all_news, filter_new
 from storage import load_config, load_seen, save_config, save_seen
-from translator import translate_to_ru
+from translator import chunk_for_discord, translate_to_ru
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +34,13 @@ load_dotenv()
 
 TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 POLL_INTERVAL_MINUTES = max(1, int(os.environ.get("POLL_INTERVAL_MINUTES", "5")))
+FULL_TRANSLATION_THREAD = os.environ.get(
+    "POST_FULL_TRANSLATION_THREAD", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# Hard cap on how many 1900-char messages a single thread may produce.
+MAX_THREAD_CHUNKS = 12
+# Cap body length before translation to keep latency and Google Translate calls reasonable.
+MAX_BODY_CHARS = 18000
 
 SOURCE_LABELS = {
     "steam": "Steam News",
@@ -152,9 +159,62 @@ class DeadlockBot(discord.Client):
                     log.warning("No access to channel %s in guild %s.", channel_id, guild_id)
                     continue
             try:
-                await channel.send(embed=embed)
+                message = await channel.send(embed=embed)
             except discord.DiscordException:
                 log.exception("Failed to post to channel %s", channel_id)
+                continue
+            await self._post_full_translation_thread(message, item)
+
+
+    async def _post_full_translation_thread(
+        self, message: discord.Message, item: NewsItem
+    ) -> None:
+        if not FULL_TRANSLATION_THREAD:
+            return
+        body = item.body_full or item.summary
+        if not body:
+            return
+        # Don't bother making a thread when the embed already shows the entire body.
+        if len(body) <= 380:
+            return
+        truncated_note = ""
+        if len(body) > MAX_BODY_CHARS:
+            body = body[:MAX_BODY_CHARS]
+            truncated_note = f"\n\n…Сокращено. Полный текст на источнике: {item.url}"
+        try:
+            thread = await message.create_thread(
+                name=f"📜 Полный перевод"[:100],
+                auto_archive_duration=10080,  # 7 days
+            )
+        except discord.Forbidden:
+            log.warning(
+                "No permission to create threads in channel %s; skipping full translation",
+                message.channel.id,
+            )
+            return
+        except discord.HTTPException:
+            log.exception("create_thread failed")
+            return
+
+        try:
+            translated = await translate_to_ru(body)
+        except Exception:
+            log.exception("Translation failed for %s", item.item_id)
+            translated = body
+
+        if truncated_note:
+            translated = (translated or "") + truncated_note
+        chunks = chunk_for_discord(translated)
+        if len(chunks) > MAX_THREAD_CHUNKS:
+            chunks = chunks[:MAX_THREAD_CHUNKS]
+            chunks[-1] += f"\n\n…Сокращено. Полный текст на источнике: {item.url}"
+
+        for chunk in chunks:
+            try:
+                await thread.send(chunk)
+            except discord.DiscordException:
+                log.exception("Failed to post chunk to thread %s", thread.id)
+                break
 
 
 async def build_embed(item: NewsItem) -> discord.Embed:
@@ -215,9 +275,11 @@ async def news(interaction: discord.Interaction) -> None:
     for item in items[:3]:
         try:
             embed = await build_embed(item)
-            await target.send(embed=embed)
+            message = await target.send(embed=embed)
         except discord.DiscordException:
             log.exception("Failed to post manual news")
+            continue
+        await bot._post_full_translation_thread(message, item)
     await interaction.followup.send("Done.", ephemeral=True)
 
 
