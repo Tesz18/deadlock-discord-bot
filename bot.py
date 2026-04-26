@@ -53,16 +53,42 @@ class DeadlockBot(discord.Client):
         self.channels: dict[str, int] = load_config()
         self.seen_ids: list[str] = load_seen()
         self.last_poll: datetime | None = None
+        self._synced_guilds: set[int] = set()
 
     async def setup_hook(self) -> None:
-        await self.tree.sync()
-        # Run once shortly after startup, then every POLL_INTERVAL_MINUTES.
+        # Per-guild sync happens in on_ready (see below) for instant availability.
+        # Global sync as a fallback so commands also appear in any guild added later
+        # — global sync can take up to 1h to propagate but doesn't hurt.
+        try:
+            await self.tree.sync()
+        except Exception:
+            log.exception("Global command sync failed")
         self.poll_news.change_interval(minutes=POLL_INTERVAL_MINUTES)
         self.poll_news.start()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id if self.user else "?")
         log.info("Configured channels: %s", self.channels)
+        await self._sync_all_guilds()
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        log.info("Joined new guild: %s (%s)", guild.name, guild.id)
+        await self._sync_guild(guild)
+
+    async def _sync_all_guilds(self) -> None:
+        for guild in self.guilds:
+            await self._sync_guild(guild)
+
+    async def _sync_guild(self, guild: discord.Guild) -> None:
+        if guild.id in self._synced_guilds:
+            return
+        try:
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            self._synced_guilds.add(guild.id)
+            log.info("Synced %d slash commands to guild %s (%s)", len(synced), guild.name, guild.id)
+        except Exception:
+            log.exception("Failed to sync slash commands to guild %s", guild.id)
 
     @tasks.loop(minutes=5)
     async def poll_news(self) -> None:
