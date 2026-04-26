@@ -10,6 +10,7 @@ Slash commands:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from dotenv import load_dotenv
 
 from news_sources import NewsItem, fetch_all_news, filter_new
 from storage import load_config, load_seen, save_config, save_seen
+from translator import translate_to_ru
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +38,10 @@ POLL_INTERVAL_MINUTES = max(1, int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
 SOURCE_LABELS = {
     "steam": "Steam News",
     "forum": "playdeadlock.com",
+}
+SOURCE_LABELS_RU = {
+    "steam": "Steam — новости",
+    "forum": "Форум playdeadlock.com",
 }
 SOURCE_COLORS = {
     "steam": discord.Color.from_rgb(23, 26, 33),
@@ -127,7 +133,7 @@ class DeadlockBot(discord.Client):
         if not self.channels:
             log.info("No channels configured — skipping post for %s", item.item_id)
             return
-        embed = build_embed(item)
+        embed = await build_embed(item)
         for guild_id, channel_id in list(self.channels.items()):
             channel = self.get_channel(channel_id)
             if channel is None:
@@ -151,16 +157,22 @@ class DeadlockBot(discord.Client):
                 log.exception("Failed to post to channel %s", channel_id)
 
 
-def build_embed(item: NewsItem) -> discord.Embed:
+async def build_embed(item: NewsItem) -> discord.Embed:
     color = SOURCE_COLORS.get(item.source, discord.Color.blurple())
+    title_ru, summary_ru = await asyncio.gather(
+        translate_to_ru(item.title),
+        translate_to_ru(item.summary),
+    )
     embed = discord.Embed(
-        title=item.title[:256],
+        title=(title_ru or item.title)[:256],
         url=item.url,
-        description=item.summary or "(no preview)",
+        description=summary_ru or item.summary or "(no preview)",
         color=color,
         timestamp=item.published_dt,
     )
-    embed.set_author(name=f"Deadlock — {SOURCE_LABELS.get(item.source, item.source)}")
+    embed.set_author(name=f"Deadlock — {SOURCE_LABELS_RU.get(item.source, item.source)}")
+    if item.image_url:
+        embed.set_image(url=item.image_url)
     if item.author:
         embed.set_footer(text=item.author)
     return embed
@@ -202,7 +214,8 @@ async def news(interaction: discord.Interaction) -> None:
     target = interaction.channel
     for item in items[:3]:
         try:
-            await target.send(embed=build_embed(item))
+            embed = await build_embed(item)
+            await target.send(embed=embed)
         except discord.DiscordException:
             log.exception("Failed to post manual news")
     await interaction.followup.send("Done.", ephemeral=True)

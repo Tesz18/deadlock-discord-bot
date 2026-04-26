@@ -23,6 +23,11 @@ STEAM_NEWS_URL = (
 )
 FORUM_RSS_URL = "https://forums.playdeadlock.com/forums/changelog.10/index.rss"
 
+# Used as a fallback embed image when no image is found in the news content.
+DEADLOCK_HEADER_IMAGE = (
+    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{DEADLOCK_APPID}/header.jpg"
+)
+
 USER_AGENT = "DeadlockNewsBot/1.0 (Discord bot)"
 
 
@@ -37,17 +42,38 @@ class NewsItem:
     published_ts: int    # unix seconds
     author: str
     summary: str         # plain-text excerpt, already trimmed
+    image_url: str       # always set (real image or Deadlock header fallback)
 
     @property
     def published_dt(self) -> datetime:
         return datetime.fromtimestamp(self.published_ts, tz=timezone.utc)
 
 
+_IMG_PATTERNS = (
+    re.compile(r"\[img\]\s*([^\[\s]+?)\s*\[/img\]", re.IGNORECASE),
+    re.compile(r"<img[^>]+src=[\"']([^\"']+)[\"']", re.IGNORECASE),
+    re.compile(r"!\[[^\]]*\]\(([^\s)]+)\)"),
+)
+
+
+def _extract_image_url(*texts: str) -> str | None:
+    """Pull the first plausible image URL out of any of the given strings."""
+    for text in texts:
+        if not text:
+            continue
+        for pat in _IMG_PATTERNS:
+            m = pat.search(text)
+            if m:
+                url = html.unescape(m.group(1).strip())
+                if url.startswith("http"):
+                    return url
+    return None
+
+
 def _strip_html(text: str) -> str:
     """Remove HTML tags / Steam BBCode-ish markup and collapse whitespace."""
     if not text:
         return ""
-    # Strip tags like <p>, <br/>, [p], [b], [/b] etc.
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\[/?[a-zA-Z]+\]", " ", text)
     text = html.unescape(text)
@@ -71,6 +97,8 @@ async def fetch_steam_news(session: aiohttp.ClientSession) -> list[NewsItem]:
         gid = str(raw.get("gid") or raw.get("url") or "")
         if not gid:
             continue
+        contents = raw.get("contents", "") or ""
+        image_url = _extract_image_url(contents) or DEADLOCK_HEADER_IMAGE
         items.append(
             NewsItem(
                 source="steam",
@@ -79,7 +107,8 @@ async def fetch_steam_news(session: aiohttp.ClientSession) -> list[NewsItem]:
                 url=raw.get("url", ""),
                 published_ts=int(raw.get("date", 0)),
                 author=raw.get("author") or raw.get("feedlabel") or "Steam",
-                summary=_truncate(_strip_html(raw.get("contents", ""))),
+                summary=_truncate(_strip_html(contents)),
+                image_url=image_url,
             )
         )
     return items
@@ -90,7 +119,6 @@ async def fetch_forum_rss(session: aiohttp.ClientSession) -> list[NewsItem]:
         resp.raise_for_status()
         body = await resp.text()
 
-    # feedparser is sync but cheap on a small RSS; run in thread to avoid blocking.
     parsed = await asyncio.to_thread(feedparser.parse, body)
     items: list[NewsItem] = []
     for entry in parsed.entries:
@@ -104,6 +132,8 @@ async def fetch_forum_rss(session: aiohttp.ClientSession) -> list[NewsItem]:
             )
         else:
             published_ts = 0
+        summary_html = entry.get("summary", "") or ""
+        image_url = _extract_image_url(summary_html) or DEADLOCK_HEADER_IMAGE
         items.append(
             NewsItem(
                 source="forum",
@@ -112,7 +142,8 @@ async def fetch_forum_rss(session: aiohttp.ClientSession) -> list[NewsItem]:
                 url=link,
                 published_ts=published_ts,
                 author=entry.get("author", "playdeadlock.com"),
-                summary=_truncate(_strip_html(entry.get("summary", ""))),
+                summary=_truncate(_strip_html(summary_html)),
+                image_url=image_url,
             )
         )
     return items
@@ -131,11 +162,9 @@ async def fetch_all_news() -> list[NewsItem]:
     items: list[NewsItem] = []
     for res in results:
         if isinstance(res, Exception):
-            # Logged by caller; just skip.
             continue
         items.extend(res)
 
-    # Sort newest first.
     items.sort(key=lambda x: x.published_ts, reverse=True)
     return items
 
@@ -143,5 +172,5 @@ async def fetch_all_news() -> list[NewsItem]:
 def filter_new(items: Iterable[NewsItem], seen_ids: set[str]) -> list[NewsItem]:
     """Return items whose id is not in seen_ids, oldest first (so older posts go first)."""
     fresh = [it for it in items if it.item_id not in seen_ids]
-    fresh.sort(key=lambda x: x.published_ts)  # oldest first when posting
+    fresh.sort(key=lambda x: x.published_ts)
     return fresh
